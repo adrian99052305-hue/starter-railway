@@ -17,13 +17,16 @@ The supplied event and disclosure data are treated as untrusted source material.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
 import os
+import random
 import re
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -39,8 +42,14 @@ MODEL_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:gen
 # Leave time for the official starter's submission POST after predict() returns.
 TOTAL_COMPUTE_BUDGET_SECONDS = 220.0
 MIN_CALL_BUDGET_SECONDS = 12.0
-# Four calls max per asset in agent mode: B, Research, Audit, C.
+# Four logical stages per asset: B, Research, Audit, C; retries can add calls.
 STAGE_LIMITS = {"direct": 55.0, "research": 55.0, "audit": 45.0, "agent": 55.0}
+# Bound transient Gemini retries *inside* each existing stage budget. Invalid key,
+# bad request and access errors are never retried. Defaults: 3 attempts total.
+GEMINI_MAX_RETRIES = 2
+RETRYABLE_HTTP = {408, 429, 500, 502, 503, 504}
+RETRY_BASE_SECONDS = 1.5
+RETRY_MAX_DELAY_SECONDS = 10.0
 
 CATEGORIES = {
     "guidance_revision", "expectation_gap", "operating_kpi", "business_momentum",
@@ -161,14 +170,68 @@ def _prediction_valid(output: dict) -> float:
     return float(p)
 
 
-def _call_gemini(api_key: str, prompt: str, *, timeout: float,
-                 max_output_tokens: int = 2048, temperature: float = 0.1) -> dict:
-    """Single bounded network call; caller handles failure and fallback.
+def _safe_error_code(exc: Exception) -> str:
+    """A stable diagnosis without leaking API credentials or disclosure contents."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP_{exc.response.status_code}"
+    if isinstance(exc, httpx.TimeoutException):
+        return "NETWORK_TIMEOUT"
+    if isinstance(exc, httpx.TransportError):
+        return "NETWORK_ERROR"
+    return type(exc).__name__
 
-    HTTP client is already included in the starter project. No new dependency.
+
+def _retry_after_seconds(header: str | None) -> float | None:
+    """Read either integer/decimal seconds or an RFC 7231 HTTP date."""
+    if not header:
+        return None
+    try:
+        return max(0.0, float(header.strip()))
+    except ValueError:
+        try:
+            dt = parsedate_to_datetime(header)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+        except (ValueError, TypeError, OverflowError):
+            return None
+
+
+def _shadow_should_run(event_id: str, ticker: str) -> bool:
+    """Deterministic optional C sampling; B still runs and is submitted for all.
+
+    Default is 1.0 (current behavior). Set EM_SHADOW_SAMPLE_RATE=0.25 only if
+    rate limits make the 4-requests/event research pipeline unsustainable.
+    """
+    raw = os.getenv("EM_SHADOW_SAMPLE_RATE", "1")
+    try:
+        fraction = float(raw)
+    except ValueError:
+        LOGGER.warning("Invalid EM_SHADOW_SAMPLE_RATE; keeping default=1")
+        return True
+    if not math.isfinite(fraction) or not 0 <= fraction <= 1:
+        LOGGER.warning("Out-of-range EM_SHADOW_SAMPLE_RATE; keeping default=1")
+        return True
+    if fraction >= 1:
+        return True
+    if fraction <= 0:
+        return False
+    digest = hashlib.sha256(f"{event_id}|{ticker}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") / 2**64 < fraction
+
+
+def _call_gemini(api_key: str, prompt: str, *, timeout: float,
+                 max_output_tokens: int = 2048, temperature: float = 0.1,
+                 stage: str = "unknown", started: float | None = None,
+                 deadline: object = None) -> dict:
+    """Call Gemini with bounded retries, safe status logging, and a hard budget.
+
+    Retries transient 408/429/5xx and transport problems only, with short
+    jittered backoff. Attempts and waits share the SAME stage time budget.
+    Timeouts are set per HTTP I/O operation (not an absolute cancellation
+    timer). A long Retry-After or nearly expired deadline stops retries.
     """
     model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
-    # Safe model identifiers only, to prevent accidental URL or header injection.
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", model):
         raise ValueError("GEMINI_MODEL contains invalid characters")
     url = MODEL_URL.format(model=model)
@@ -179,21 +242,69 @@ def _call_gemini(api_key: str, prompt: str, *, timeout: float,
             "maxOutputTokens": max_output_tokens,
         },
     }
-    with httpx.Client(timeout=httpx.Timeout(timeout)) as client:
-        response = client.post(url, headers={"x-goog-api-key": api_key}, json=body)
-        response.raise_for_status()
-        result = response.json()
-    candidates = result.get("candidates") or []
-    parts = (candidates[0].get("content") or {}).get("parts") or [] if candidates else []
-    text = "".join(part.get("text", "") for part in parts if isinstance(part, dict)).strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
-    if not text:
-        raise ValueError("Gemini returned no JSON text")
-    payload = json.loads(text)
-    if not isinstance(payload, dict):
-        raise ValueError("Gemini response JSON not an object")
-    return payload
+    stage_started = time.monotonic()
+    max_attempts = GEMINI_MAX_RETRIES + 1
+    for attempt in range(1, max_attempts + 1):
+        available = timeout - (time.monotonic() - stage_started)
+        if started is not None:
+            available = min(available, _remaining_time(started, deadline))
+        if available < 3.0:
+            raise TimeoutError(f"Insufficient time for {stage} API call")
+        try:
+            # A single attempt cannot exceed the remaining stage or event budget.
+            with httpx.Client(timeout=httpx.Timeout(max(1.0, available - 1.0))) as client:
+                response = client.post(url, headers={"x-goog-api-key": api_key}, json=body)
+                response.raise_for_status()
+                result = response.json()
+            candidates = result.get("candidates") or []
+            parts = (candidates[0].get("content") or {}).get("parts") or [] if candidates else []
+            content = "".join(part.get("text", "") for part in parts if isinstance(part, dict)).strip()
+            if content.startswith("```"):
+                content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content).strip()
+            if not content:
+                raise ValueError("Gemini returned no JSON text")
+            payload = json.loads(content)
+            if not isinstance(payload, dict):
+                raise ValueError("Gemini response JSON not an object")
+            return payload
+        except (httpx.HTTPStatusError, httpx.TransportError) as exc:
+            if isinstance(exc, httpx.HTTPStatusError):
+                status = exc.response.status_code
+                retriable = status in RETRYABLE_HTTP or 500 <= status < 600
+                delay_header = _retry_after_seconds(exc.response.headers.get("Retry-After"))
+                # Keep only Google API's machine-readable error status, never its
+                # free-form message (which might contain sensitive request data).
+                api_status = ""
+                try:
+                    error_obj = exc.response.json().get("error", {})
+                    code = error_obj.get("status", "")
+                    if isinstance(code, str) and re.fullmatch(r"[A-Z_]{3,48}", code):
+                        api_status = code
+                except (ValueError, AttributeError, TypeError):
+                    pass
+            else:
+                retriable = True
+                delay_header = None
+                api_status = ""
+            category = _safe_error_code(exc)
+            available = timeout - (time.monotonic() - stage_started)
+            if started is not None:
+                available = min(available, _remaining_time(started, deadline))
+            retry_allowed = retriable and attempt < max_attempts
+            delay = min(RETRY_MAX_DELAY_SECONDS,
+                        RETRY_BASE_SECONDS * (2 ** (attempt - 1))) * random.uniform(0.8, 1.2)
+            if delay_header is not None:
+                delay = max(delay, delay_header)
+            retry_allowed = retry_allowed and delay + 3.0 < available
+            LOGGER.warning(
+                "Gemini stage=%s error=%s api_status=%s attempt=%d/%d retry=%s%s",
+                stage, category, api_status or "unknown", attempt, max_attempts,
+                "yes" if retry_allowed else "no",
+                f" delay_s={delay:.1f}" if retry_allowed else "",
+            )
+            if not retry_allowed:
+                raise
+            time.sleep(delay)
 
 
 def _remaining_time(started: float, prediction_deadline: object) -> float:
@@ -221,7 +332,8 @@ def _research(facts: str, preview: str, api_key: str,
         {"facts": facts, "preview": preview or "[NOT PROVIDED]"},
         ensure_ascii=False, sort_keys=True))
     data = _call_gemini(api_key, prompt, timeout=_stage_timeout("research", started, deadline),
-                        max_output_tokens=4096, temperature=0.15)
+                        max_output_tokens=4096, temperature=0.15,
+                        stage="research", started=started, deadline=deadline)
     raw = data.get("signals")
     if not isinstance(raw, list):
         raise ValueError("Research response had no signals list")
@@ -264,7 +376,8 @@ def _audit(facts: str, preview: str, proposals: list[dict], api_key: str,
         ensure_ascii=False, sort_keys=True))
     reviews = _call_gemini(api_key, audit_prompt,
                            timeout=_stage_timeout("audit", started, deadline),
-                           max_output_tokens=2048, temperature=0.0).get("reviews")
+                           max_output_tokens=2048, temperature=0.0,
+                           stage="audit", started=started, deadline=deadline).get("reviews")
     if not isinstance(reviews, list):
         raise ValueError("Auditor returned no reviews list")
     accepted = set()
@@ -288,7 +401,8 @@ def _audit(facts: str, preview: str, proposals: list[dict], api_key: str,
 def _model_call(api_key: str, prompt: str, stage: str,
                 started: float, deadline: object) -> float:
     raw = _call_gemini(api_key, prompt, timeout=_stage_timeout(stage, started, deadline),
-                       max_output_tokens=2048, temperature=0.1)
+                       max_output_tokens=2048, temperature=0.1,
+                       stage=stage, started=started, deadline=deadline)
     return _prediction_valid(raw)
 
 
@@ -308,7 +422,8 @@ def _emit_prediction(event_id: str, ticker: str, mode: str, *,
 def _predict_asset(facts: str, preview: str, ticker: str, api_key: str | None,
                    mode: str, started: float, deadline: object, event_id: str) -> float:
     if not api_key or not facts:
-        LOGGER.warning("No Gemini key or facts for %s; neutral fallback", ticker)
+        LOGGER.warning("Cannot predict %s: key_present=%s facts_present=%s; neutral fallback",
+                       ticker, bool(api_key), bool(facts))
         _emit_prediction(event_id, ticker, mode, b=None, c=None, signals=0,
                          submitted=0.5, status="missing_credentials_or_facts")
         return 0.5
@@ -316,10 +431,15 @@ def _predict_asset(facts: str, preview: str, ticker: str, api_key: str | None,
     try:
         b = _model_call(api_key, direct_prompt, "direct", started, deadline)
     except Exception as exc:  # fail closed to the previously computed safe prediction
-        LOGGER.warning("Direct prediction failed for %s: %s", ticker, type(exc).__name__)
+        LOGGER.warning("Direct prediction failed for %s: %s", ticker, _safe_error_code(exc))
         _emit_prediction(event_id, ticker, mode, b=None, c=None, signals=0,
-                         submitted=0.5, status="direct_failed:" + type(exc).__name__)
+                         submitted=0.5, status="direct_failed:" + _safe_error_code(exc))
         return 0.5
+
+    if mode == "shadow" and not _shadow_should_run(event_id, ticker):
+        _emit_prediction(event_id, ticker, mode, b=b, c=None, signals=0,
+                         submitted=b, status="shadow_sampled_out")
+        return b
 
     if mode == "direct":
         _emit_prediction(event_id, ticker, mode, b=b, c=None, signals=0,
@@ -331,9 +451,9 @@ def _predict_asset(facts: str, preview: str, ticker: str, api_key: str | None,
         proposals = _research(facts, preview, api_key, started, deadline)
         signals = _audit(facts, preview, proposals, api_key, started, deadline)
     except Exception as exc:  # fail closed to the previously computed safe prediction
-        LOGGER.warning("Agent failed for %s (%s); using direct B", ticker, type(exc).__name__)
+        LOGGER.warning("Agent failed for %s (%s); using direct B", ticker, _safe_error_code(exc))
         _emit_prediction(event_id, ticker, mode, b=b, c=None, signals=0,
-                         submitted=b, status="agent_failed:" + type(exc).__name__)
+                         submitted=b, status="agent_failed:" + _safe_error_code(exc))
         return b
 
     if not signals:
@@ -346,9 +466,9 @@ def _predict_asset(facts: str, preview: str, ticker: str, api_key: str | None,
         c = _model_call(api_key, make_prediction_prompt(facts, preview, signals),
                         "agent", started, deadline)
     except Exception as exc:  # fail closed to the previously computed safe prediction
-        LOGGER.warning("Agent prediction failed %s (%s); using B", ticker, type(exc).__name__)
+        LOGGER.warning("Agent prediction failed %s (%s); using B", ticker, _safe_error_code(exc))
         _emit_prediction(event_id, ticker, mode, b=b, c=None, signals=len(signals),
-                         submitted=b, status="agent_predict_failed:" + type(exc).__name__)
+                         submitted=b, status="agent_predict_failed:" + _safe_error_code(exc))
         return b
 
     submitted = c if mode == "agent" else b
